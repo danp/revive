@@ -3,6 +3,9 @@ package lint
 import (
 	"errors"
 	"fmt"
+	"go/importer"
+	"go/token"
+	"go/types"
 	"io"
 	"os"
 	"path/filepath"
@@ -24,6 +27,9 @@ type moduleExports struct {
 	known   map[string]bool         // Registered package directories.
 	pending []string                // Package directories whose dependencies have not been loaded.
 	exports map[string]exportResult // Export data files and errors indexed by import path.
+
+	importerOnce   sync.Once
+	sharedImporter *lockedImporter // Type importer shared by the module's packages.
 }
 
 type exportResult struct {
@@ -220,4 +226,28 @@ func (m *moduleExports) relativeDir(dir string) string {
 		return dir
 	}
 	return "." + string(filepath.Separator) + rel
+}
+
+// importer returns the type importer shared by all packages of the module, so
+// export data of a common dependency is decoded once instead of once per package.
+func (m *moduleExports) importer() types.Importer {
+	m.importerOnce.Do(func() {
+		// Imported objects get positions in this file set rather than in the
+		// file set of the package being linted.
+		m.sharedImporter = &lockedImporter{imp: importer.ForCompiler(token.NewFileSet(), "gc", m.lookup)}
+	})
+	return m.sharedImporter
+}
+
+// lockedImporter serializes calls to an importer that is not safe for concurrent use.
+type lockedImporter struct {
+	mu  sync.Mutex
+	imp types.Importer
+}
+
+// Import implements [types.Importer].
+func (l *lockedImporter) Import(path string) (*types.Package, error) {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	return l.imp.Import(path)
 }

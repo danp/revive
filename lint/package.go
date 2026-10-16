@@ -153,7 +153,7 @@ func (p *Package) importer() types.Importer {
 	if p.exports == nil {
 		return importer.Default()
 	}
-	return importer.ForCompiler(p.fset, "gc", p.exports.lookup)
+	return p.exports.importer()
 }
 
 // TypeOf returns the type of expression.

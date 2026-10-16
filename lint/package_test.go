@@ -2,9 +2,11 @@ package lint_test
 
 import (
 	"go/ast"
+	"go/types"
 	"os"
 	"path/filepath"
 	"slices"
+	"sync"
 	"testing"
 
 	"github.com/mgechev/revive/lint"
@@ -98,15 +100,7 @@ var (
 )
 `,
 	}
-	for name, content := range files {
-		path := filepath.Join(rootDir, name)
-		if err := os.MkdirAll(filepath.Dir(path), 0o750); err != nil {
-			t.Fatal(err)
-		}
-		if err := os.WriteFile(path, []byte(content), 0o600); err != nil {
-			t.Fatal(err)
-		}
-	}
+	writeFiles(t, rootDir, files)
 
 	l := lint.New(os.ReadFile, 0)
 	pkgA := []string{
@@ -138,5 +132,77 @@ var (
 	}
 	if !slices.Equal(got, want) {
 		t.Errorf("got types %q, want %q", got, want)
+	}
+}
+
+// importedPkgsRule records the package each linted package imports as importPath.
+type importedPkgsRule struct {
+	importPath string
+
+	mu       sync.Mutex
+	imported map[*types.Package]bool
+}
+
+func (*importedPkgsRule) Name() string { return "imported-pkgs" }
+
+func (r *importedPkgsRule) Apply(file *lint.File, _ lint.Arguments) []lint.Failure {
+	if err := file.Pkg.TypeCheck(); err != nil {
+		return []lint.Failure{lint.NewInternalFailure(err.Error())}
+	}
+
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	for _, imp := range file.Pkg.TypesPkg().Imports() {
+		if imp.Path() == r.importPath {
+			r.imported[imp] = true
+		}
+	}
+	return nil
+}
+
+func TestPackage_TypeCheckSharesImportedPackages(t *testing.T) {
+	// Keep module resolution independent of the caller's workspace and build flags.
+	t.Setenv("GOFLAGS", "")
+	t.Setenv("GOWORK", "off")
+
+	rootDir := t.TempDir()
+	writeFiles(t, rootDir, map[string]string{
+		"go.mod": "module example.com/m\n\ngo 1.21\n",
+		"b/b.go": "package b\n\ntype T struct{}\n",
+		"a/a.go": "package a\n\nimport \"example.com/m/b\"\n\nvar X b.T\n",
+		"c/c.go": "package c\n\nimport \"example.com/m/b\"\n\nvar Y b.T\n",
+	})
+
+	rule := &importedPkgsRule{importPath: "example.com/m/b", imported: map[*types.Package]bool{}}
+	l := lint.New(os.ReadFile, 0)
+	failures, err := l.Lint([][]string{
+		{filepath.Join(rootDir, "a", "a.go")},
+		{filepath.Join(rootDir, "c", "c.go")},
+	}, []lint.Rule{rule}, lint.Config{})
+	if err != nil {
+		t.Fatal("unexpected error from linting:", err)
+	}
+	for failure := range failures {
+		t.Errorf("unexpected failure: %s", failure.Failure)
+	}
+
+	// Packages of the same module decode a common dependency once and share it.
+	if got := len(rule.imported); got != 1 {
+		t.Errorf("got %d distinct imported packages for %q, want 1", got, rule.importPath)
+	}
+}
+
+// writeFiles writes files, keyed by slash-separated path relative to rootDir.
+func writeFiles(t *testing.T, rootDir string, files map[string]string) {
+	t.Helper()
+
+	for name, content := range files {
+		path := filepath.Join(rootDir, filepath.FromSlash(name))
+		if err := os.MkdirAll(filepath.Dir(path), 0o750); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(path, []byte(content), 0o600); err != nil {
+			t.Fatal(err)
+		}
 	}
 }
